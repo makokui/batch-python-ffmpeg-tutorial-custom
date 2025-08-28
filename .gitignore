@@ -294,4 +294,4 @@ src/config.py
 *.xsd.cs
 
 # Azurite local DB
-__azurite_db_*.__.json
+__azurite_db_*.json

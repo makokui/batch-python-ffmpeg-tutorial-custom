@@ -109,13 +109,7 @@ python .\batch_python_tutorial_ffmpeg.py
 - azure-identity >= 1.17.0（AAD のみ）
 - azure-storage-blob >= 12.19.0（ユーザー委任 SAS を使用。Track 2 SDK）
 
-## ライセンス / 行動規範
-
 ## Resources
 
 - [Azure Batch documentation](https://learn.microsoft.com/azure/batch/)
 - [Azure Batch code samples](https://github.com/Azure/azure-batch-samples)
-
-## Project code of conduct
-
-This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/). For more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
