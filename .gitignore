@@ -274,6 +274,12 @@ paket-files/
 __pycache__/
 *.pyc
 
+# Python venv
+.venv/
+
+# Local config with secrets
+src/config.py
+
 # Cake - Uncomment if you are using it
 # tools/**
 # !tools/packages.config

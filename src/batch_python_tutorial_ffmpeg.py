@@ -4,17 +4,25 @@ import io
 import os
 import sys
 import time
+import logging
 import config
 
-try:
-    input = raw_input
-except NameError:
-    pass
+"""
+Python 3 専用のため raw_input 互換対応は不要
+"""
 
-import azure.storage.blob as azureblob
-import azure.batch.batch_service_client as batch
-import azure.batch.batch_auth as batchauth
-import azure.batch.models as batchmodels
+from azure.identity import DefaultAzureCredential
+from azure.storage.blob import (
+    BlobServiceClient,
+    BlobSasPermissions,
+    generate_blob_sas,
+    generate_container_sas,
+)
+from azure.batch import BatchServiceClient
+from azure.batch import models as batchmodels
+from azure.batch import batch_auth
+from msrest.authentication import BasicTokenAuthentication
+from azure.core.exceptions import HttpResponseError
 
 sys.path.append('.')
 sys.path.append('..')
@@ -24,135 +32,156 @@ sys.path.append('..')
 # for the Batch and Storage client objects.
 
 
-def query_yes_no(question, default="yes"):
-    """
-    Prompts the user for yes/no input, displaying the specified question text.
-
-    :param str question: The text of the prompt for input.
-    :param str default: The default if the user hits <ENTER>. Acceptable values
-    are 'yes', 'no', and None.
-    :rtype: str
-    :return: 'yes' or 'no'
-    """
-    valid = {'y': 'yes', 'n': 'no'}
-    if default is None:
-        prompt = ' [y/n] '
-    elif default == 'yes':
-        prompt = ' [Y/n] '
-    elif default == 'no':
-        prompt = ' [y/N] '
-    else:
-        raise ValueError("Invalid default answer: '{}'".format(default))
-
-    while 1:
-        choice = input(question + prompt).lower()
-        if default and not choice:
-            return default
-        try:
-            return valid[choice[0]]
-        except (KeyError, IndexError):
-            print("Please respond with 'yes' or 'no' (or 'y' or 'n').\n")
+def _setup_logger():
+    """セットアップ済みロガーを返す。LOG_LEVEL 環境変数 or config._LOG_LEVEL を尊重。"""
+    logger = logging.getLogger("batch_ffmpeg")
+    if logger.handlers:
+        return logger
+    # 既定 INFO。env > config の順で解釈
+    level_name = os.getenv("LOG_LEVEL") or getattr(config, "_LOG_LEVEL", "INFO")
+    level = getattr(logging, str(level_name).upper(), logging.INFO)
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(level)
+    # noisy なライブラリの既定レベルを抑制（必要に応じて）
+    logging.getLogger("azure").setLevel(logging.WARNING)
+    return logger
 
 
-def print_batch_exception(batch_exception):
-    """
-    Prints the contents of the specified Batch exception.
+log = _setup_logger()
 
-    :param batch_exception:
-    """
-    print('-------------------------------------------')
-    print('Exception encountered:')
+
+def log_batch_exception(batch_exception):
+    """Log details of a Batch exception."""
+    log.error("----- Batch exception -----")
     if batch_exception.error and \
             batch_exception.error.message and \
             batch_exception.error.message.value:
-        print(batch_exception.error.message.value)
+        log.error(batch_exception.error.message.value)
         if batch_exception.error.values:
-            print()
             for mesg in batch_exception.error.values:
-                print('{}:\t{}'.format(mesg.key, mesg.value))
-    print('-------------------------------------------')
+                log.error("%s: %s", mesg.key, mesg.value)
+    log.error("----------------------")
 
 
-def upload_file_to_container(block_blob_client, container_name, file_path):
-    """
-    Uploads a local file to an Azure Blob storage container.
+class StorageV12:
+    """Entra ID + v12 SDK のラッパー（ユーザー委任 SAS を発行）。"""
+    def __init__(self, account_name: str, credential: DefaultAzureCredential):
+        self.account_name = account_name
+        self.account_url = f"https://{account_name}.blob.core.windows.net"
+        self.cred = credential
+        self.svc = BlobServiceClient(account_url=self.account_url, credential=self.cred)
 
-    :param block_blob_client: A blob service client.
-    :type block_blob_client: `azure.storage.blob.BlockBlobService`
-    :param str container_name: The name of the Azure Blob storage container.
-    :param str file_path: The local path to the file.
-    :rtype: `azure.batch.models.ResourceFile`
-    :return: A ResourceFile initialized with a SAS URL appropriate for Batch
-    tasks.
-    """
+    def ensure_container(self, container_name: str):
+        client = self.svc.get_container_client(container_name)
+        try:
+            if client.exists():
+                log.debug("Container '%s': exists", container_name)
+            else:
+                self.svc.create_container(container_name)
+                log.info("Created container '%s'", container_name)
+        except HttpResponseError as e:
+            # AAD での RBAC 不足時に 403 AuthorizationFailure となる
+            if getattr(e, 'status_code', None) == 403 or 'AuthorizationFailure' in str(e):
+                log.error("Insufficient Storage permissions (AuthorizationFailure). Assign 'Storage Blob Data Contributor' or higher at the storage account scope.")
+                log.error("For user delegation SAS, 'Microsoft.Storage/storageAccounts/userDelegationKeys/read' permission is also required.")
+                log.error("Also verify you're signed in to the correct tenant/subscription (az login / VS Code Azure extension).")
+            raise
+
+    def upload_blob_from_path(self, container_name: str, blob_name: str, file_path: str, overwrite=True):
+        log.info("Upload: %s -> container '%s' blob '%s'", file_path, container_name, blob_name)
+        blob = self.svc.get_blob_client(container=container_name, blob=blob_name)
+        with open(file_path, "rb") as f:
+            blob.upload_blob(f, overwrite=overwrite)
+
+    def _get_user_delegation_key(self, hours=2):
+        now = datetime.datetime.now(datetime.UTC)
+        return self.svc.get_user_delegation_key(
+            key_start_time=now - datetime.timedelta(minutes=5),
+            key_expiry_time=now + datetime.timedelta(hours=hours)
+        )
+
+    def make_blob_user_delegation_sas_url(self, container_name: str, blob_name: str,
+                                          permissions: BlobSasPermissions,
+                                          expiry_hours: int = 2) -> str:
+        udk = self._get_user_delegation_key(hours=expiry_hours)
+        sas = generate_blob_sas(
+            account_name=self.account_name,
+            container_name=container_name,
+            blob_name=blob_name,
+            user_delegation_key=udk,
+            permission=permissions,
+            expiry=datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=expiry_hours)
+        )
+        return f"{self.account_url}/{container_name}/{blob_name}?{sas}"
+
+    def make_container_user_delegation_sas_url(self, container_name: str,
+                                               permissions: BlobSasPermissions,
+                                               expiry_hours: int = 2) -> str:
+        udk = self._get_user_delegation_key(hours=expiry_hours)
+        sas = generate_container_sas(
+            account_name=self.account_name,
+            container_name=container_name,
+            user_delegation_key=udk,
+            permission=permissions,
+            expiry=datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=expiry_hours)
+        )
+        return f"{self.account_url}/{container_name}?{sas}"
+
+    def delete_container_if_exists(self, container_name: str):
+        client = self.svc.get_container_client(container_name)
+        if client.exists():
+            log.info("Deleting container '%s'", container_name)
+            self.svc.delete_container(container_name)
+        else:
+            log.debug("Container '%s' does not exist (skip delete)", container_name)
+
+
+class AADTokenCredentials(BasicTokenAuthentication):
+    """毎リクエスト直前に AAD トークンを更新し、msrest 既定の挙動で送る安全版。"""
+    def __init__(self, credential: DefaultAzureCredential, scope: str):
+        self.credential = credential
+        self.scope = scope
+        super().__init__(self._token_dict())  # 初期トークンを設定
+
+    def _token_dict(self):
+        t = self.credential.get_token(self.scope)
+        return {"access_token": t.token}
+
+    def signed_session(self, session=None):
+        # super を呼ぶ前に必ず最新トークンを注入（msrest は self.token を参照する）
+        self.token = self._token_dict()
+        return super().signed_session(session)
+
+
+def upload_file_to_container(storage: StorageV12, container_name: str, file_path: str):
+    """1) アップロード 2) 読み取りユーザー委任 SAS を返す"""
     blob_name = os.path.basename(file_path)
-
-    print('Uploading file {} to container [{}]...'.format(file_path,
-                                                          container_name))
-
-    block_blob_client.create_blob_from_path(container_name,
-                                            blob_name,
-                                            file_path)
-
-    # Obtain the SAS token for the container.
-    sas_token = get_container_sas_token(block_blob_client,
-                                        container_name, azureblob.BlobPermissions.READ)
-
-    sas_url = block_blob_client.make_blob_url(container_name,
-                                              blob_name,
-                                              sas_token=sas_token)
-
-    return batchmodels.ResourceFile(file_path=blob_name,
-                                    http_url=sas_url)
+    storage.upload_blob_from_path(container_name, blob_name, file_path)
+    sas_url = storage.make_blob_user_delegation_sas_url(
+        container_name, blob_name, permissions=BlobSasPermissions(read=True))
+    return batchmodels.ResourceFile(file_path=blob_name, http_url=sas_url)
 
 
-def get_container_sas_token(block_blob_client,
-                            container_name, blob_permissions):
-    """
-    Obtains a shared access signature granting the specified permissions to the
-    container.
-
-    :param block_blob_client: A blob service client.
-    :type block_blob_client: `azure.storage.blob.BlockBlobService`
-    :param str container_name: The name of the Azure Blob storage container.
-    :param BlobPermissions blob_permissions:
-    :rtype: str
-    :return: A SAS token granting the specified permissions to the container.
-    """
-    # Obtain the SAS token for the container, setting the expiry time and
-    # permissions. In this case, no start time is specified, so the shared
-    # access signature becomes valid immediately. Expiration is in 2 hours.
-    container_sas_token = \
-        block_blob_client.generate_container_shared_access_signature(
-            container_name,
-            permission=blob_permissions,
-            expiry=datetime.datetime.utcnow() + datetime.timedelta(hours=2))
-
-    return container_sas_token
+def get_container_sas_url_for_write(storage: StorageV12, container_name: str):
+    """出力用: コンテナーへの書き込みを許可するユーザー委任 SAS URL を返す"""
+    perms = BlobSasPermissions(read=True, write=True, add=True, create=True, list=True)
+    return storage.make_container_user_delegation_sas_url(container_name, perms)
 
 
-def get_container_sas_url(block_blob_client,
-                          container_name, blob_permissions):
-    """
-    Obtains a shared access signature URL that provides write access to the 
-    ouput container to which the tasks will upload their output.
+"""旧 get_container_sas_url は v12+AAD では get_container_sas_url_for_write に置換"""
 
-    :param block_blob_client: A blob service client.
-    :type block_blob_client: `azure.storage.blob.BlockBlobService`
-    :param str container_name: The name of the Azure Blob storage container.
-    :param BlobPermissions blob_permissions:
-    :rtype: str
-    :return: A SAS URL granting the specified permissions to the container.
-    """
-    # Obtain the SAS token for the container.
-    sas_token = get_container_sas_token(block_blob_client,
-                                        container_name, azureblob.BlobPermissions.WRITE)
 
-    # Construct SAS URL for the container
-    container_sas_url = "https://{}.blob.core.windows.net/{}?{}".format(
-        config._STORAGE_ACCOUNT_NAME, container_name, sas_token)
-
-    return container_sas_url
+def _normalize_batch_url(url: str) -> str:
+    """Ensure Batch URL has scheme and no trailing slash."""
+    if not url or not isinstance(url, str):
+        raise ValueError("config._BATCH_ACCOUNT_URL is not set. Specify 'https://<account>.<region>.batch.azure.com'.")
+    u = url.strip()
+    if not u.lower().startswith("http"):
+        u = "https://" + u
+    return u.rstrip('/')
 
 
 def create_pool(batch_service_client, pool_id):
@@ -166,7 +195,7 @@ def create_pool(batch_service_client, pool_id):
     :param str offer: Marketplace image offer
     :param str sku: Marketplace image sky
     """
-    print('Creating pool [{}]...'.format(pool_id))
+    log.info("Creating pool '%s'...", pool_id)
 
     # Create a new pool of Linux compute nodes using an Azure Virtual Machines
     # Marketplace image. For more information about creating pools of Linux
@@ -176,16 +205,36 @@ def create_pool(batch_service_client, pool_id):
     # The start task installs ffmpeg on each node from an available repository, using
     # an administrator user identity.
 
-    new_pool = batch.models.PoolAddParameter(
+    # 任意の VNet/Subnet を指定（_SUBNET_ID が空なら None）
+    net_conf = None
+    if getattr(config, '_SUBNET_ID', ''):
+        net_conf = batchmodels.NetworkConfiguration(
+            subnet_id=config._SUBNET_ID
+        )
+
+    # Azure Monitor Agent 拡張
+    ama_extension = batchmodels.VMExtension(
+        name="AzureMonitorLinuxAgent",
+        publisher="Microsoft.Azure.Monitor",
+        type="AzureMonitorLinuxAgent",
+        type_handler_version="1.*",
+        auto_upgrade_minor_version=True,
+        settings={}  # 基本は空でOK、DCRに紐づければLAに飛ぶ
+    )
+
+    new_pool = batchmodels.PoolAddParameter(
         id=pool_id,
         virtual_machine_configuration=batchmodels.VirtualMachineConfiguration(
             image_reference=batchmodels.ImageReference(
                 publisher="Canonical",
-                offer="UbuntuServer",
-                sku="18.04-LTS",
+                offer="0001-com-ubuntu-server-jammy",
+                sku="22_04-lts",
                 version="latest"
             ),
-            node_agent_sku_id="batch.node.ubuntu 18.04"),
+            node_agent_sku_id="batch.node.ubuntu 22.04",
+            extensions=[ama_extension]   # ←ここで拡張を追加
+        ),
+        network_configuration=net_conf,
         vm_size=config._POOL_VM_SIZE,
         target_dedicated_nodes=config._DEDICATED_POOL_NODE_COUNT,
         target_low_priority_nodes=config._LOW_PRIORITY_POOL_NODE_COUNT,
@@ -199,7 +248,14 @@ def create_pool(batch_service_client, pool_id):
         )
     )
 
-    batch_service_client.pool.add(new_pool)
+    try:
+        batch_service_client.pool.add(new_pool)
+    except batchmodels.BatchErrorException as e:
+        code = getattr(getattr(e, 'error', None), 'code', None)
+        if code == 'PoolExists':
+            log.info("Pool '%s' already exists. Reusing it.", pool_id)
+        else:
+            raise
 
 
 def create_job(batch_service_client, job_id, pool_id):
@@ -211,13 +267,20 @@ def create_job(batch_service_client, job_id, pool_id):
     :param str job_id: The ID for the job.
     :param str pool_id: The ID for the pool.
     """
-    print('Creating job [{}]...'.format(job_id))
+    log.info("Creating job '%s'...", job_id)
 
-    job = batch.models.JobAddParameter(
+    job = batchmodels.JobAddParameter(
         id=job_id,
-        pool_info=batch.models.PoolInformation(pool_id=pool_id))
+        pool_info=batchmodels.PoolInformation(pool_id=pool_id))
 
-    batch_service_client.job.add(job)
+    try:
+        batch_service_client.job.add(job)
+    except batchmodels.BatchErrorException as e:
+        code = getattr(getattr(e, 'error', None), 'code', None)
+        if code == 'JobExists':
+            log.info("Job '%s' already exists. Reusing it.", job_id)
+        else:
+            raise
 
 
 def add_tasks(batch_service_client, job_id, input_files, output_container_sas_url):
@@ -233,7 +296,7 @@ def add_tasks(batch_service_client, job_id, input_files, output_container_sas_ur
     the specified Azure Blob storage container.
     """
 
-    print('Adding {} tasks to job [{}]...'.format(len(input_files), job_id))
+    log.info("Adding %d tasks to job '%s'...", len(input_files), job_id)
 
     tasks = list()
 
@@ -242,7 +305,7 @@ def add_tasks(batch_service_client, job_id, input_files, output_container_sas_ur
         output_file_path = "".join((input_file_path).split('.')[:-1]) + '.mp3'
         command = "/bin/bash -c \"ffmpeg -i {} {} \"".format(
             input_file_path, output_file_path)
-        tasks.append(batch.models.TaskAddParameter(
+        tasks.append(batchmodels.TaskAddParameter(
             id='Task{}'.format(idx),
             command_line=command,
             resource_files=[input_file],
@@ -270,50 +333,174 @@ def wait_for_tasks_to_complete(batch_service_client, job_id, timeout):
     period, an exception will be raised.
     """
     timeout_expiration = datetime.datetime.now() + timeout
-
-    print("Monitoring all tasks for 'Completed' state, timeout in {}..."
-          .format(timeout), end='')
-
+    log.info("Monitoring tasks until 'Completed' (timeout: %s)", timeout)
+    next_log = time.time()
     while datetime.datetime.now() < timeout_expiration:
-        print('.', end='')
-        sys.stdout.flush()
         tasks = batch_service_client.task.list(job_id)
 
         incomplete_tasks = [task for task in tasks if
                             task.state != batchmodels.TaskState.completed]
         if not incomplete_tasks:
-            print()
+            log.info("All tasks reached 'Completed'.")
             return True
         else:
+            if time.time() >= next_log:
+                remain = (timeout_expiration - datetime.datetime.now()).total_seconds()
+                log.debug("Monitoring... incomplete: %d, ~%ds left", len(incomplete_tasks), int(remain))
+                next_log = time.time() + 5
             time.sleep(1)
 
-    print()
-    raise RuntimeError("ERROR: Tasks did not reach 'Completed' state within "
-                       "timeout period of " + str(timeout))
+    # Timeout: dump diagnostics before raising
+    try:
+        dump_batch_diagnostics(batch_service_client, job_id)
+    except Exception as diag_err:
+        log.warning("Failed to output diagnostics: %s", diag_err)
+        raise RuntimeError(f"ERROR: tasks did not reach 'Completed' within timeout: {timeout}")
+
+
+def dump_batch_diagnostics(batch_service_client, job_id, max_log_bytes=4096):
+    """Prints a concise diagnostics report for the job/pool/nodes/tasks.
+
+    - Task states summary and per-task details (exit code, failure info)
+    - Tail of stdout/stderr for each task (best-effort)
+    - Pool allocation and compute node states, including start task info
+    """
+    log.info("===== Azure Batch Diagnostics (start) =====")
+    # Resolve pool id from job
+    job = batch_service_client.job.get(job_id)
+    pool_id = None
+    if job.pool_info and getattr(job.pool_info, 'pool_id', None):
+        pool_id = job.pool_info.pool_id
+    log.info("Job: %s; Pool: %s", job_id, pool_id)
+
+    # Tasks overview
+    tasks = list(batch_service_client.task.list(job_id))
+    by_state = {}
+    for t in tasks:
+        s = str(t.state)
+        by_state[s] = by_state.get(s, 0) + 1
+    log.info("Task states: %s", by_state)
+
+    for t in tasks:
+        exec_info = getattr(t, 'execution_info', None)
+        exit_code = getattr(exec_info, 'exit_code', None) if exec_info else None
+        failure = getattr(exec_info, 'failure_info', None) if exec_info else None
+        node_info = getattr(t, 'node_info', None)
+        node_id = getattr(node_info, 'node_id', None) if node_info else None
+        log.info("- Task %s: state=%s, node=%s, exit=%s", t.id, t.state, node_id, exit_code)
+        if failure:
+            log.warning("  failure: category=%s, code=%s, message=%s", failure.category, failure.code, getattr(failure, 'message', None))
+            if getattr(failure, 'details', None):
+                for d in failure.details:
+                    log.warning("    %s: %s", d.name, d.value)
+        # Fetch stdout/stderr (best-effort)
+        for fname in ("stdout.txt", "stderr.txt"):
+            try:
+                stream = io.BytesIO()
+                batch_service_client.file.get_from_task(job_id, t.id, fname, stream)
+                data = stream.getvalue()
+                if not data:
+                    continue
+                tail = data[-max_log_bytes:]
+                log.info("  %s (last %d bytes):\n%s", fname, len(tail), tail.decode(errors='replace'))
+            except Exception as _:
+                pass
+
+    # Pool / nodes
+    if pool_id:
+        try:
+            pool = batch_service_client.pool.get(pool_id)
+            alloc = getattr(pool, 'allocation_state', None)
+            log.info("Pool state=%s, allocation=%s, target(ded/low)=%s/%s, current(ded/low)=%s/%s",
+                     pool.state, alloc,
+                     pool.target_dedicated_nodes, pool.target_low_priority_nodes,
+                     pool.current_dedicated_nodes, pool.current_low_priority_nodes)
+        except Exception as _:
+            pass
+        try:
+            nodes = list(batch_service_client.compute_node.list(pool_id))
+            log.info("Nodes: %d", len(nodes))
+            for n in nodes[:50]:
+                start_info = getattr(n, 'start_task_information', None)
+                st_state = getattr(start_info, 'state', None) if start_info else None
+                st_exit = getattr(start_info, 'exit_code', None) if start_info else None
+                log.info("- Node %s: state=%s, sched=%s, start_task=%s, start_exit=%s",
+                         n.id, n.state, getattr(n, 'scheduling_state', None), st_state, st_exit)
+                if start_info and getattr(start_info, 'failure_info', None):
+                    fi = start_info.failure_info
+                    log.warning("  start_task failure: category=%s, code=%s, message=%s",
+                                fi.category, fi.code, getattr(fi, 'message', None))
+        except Exception as _:
+            pass
+    log.info("===== Azure Batch Diagnostics (end) =====")
+
+
+# ==========================
+# Utility: delete-if-exists
+# ==========================
+def _delete_job_if_exists(batch_client: BatchServiceClient, job_id: str, wait_seconds: int = 60):
+    """Delete a job if it exists and wait until it's gone (best-effort)."""
+    try:
+        log.info("Deleting existing job '%s' if present...", job_id)
+        batch_client.job.delete(job_id)
+    except batchmodels.BatchErrorException as e:
+        code = getattr(getattr(e, 'error', None), 'code', None)
+        if code not in ('JobNotFound', 'ResourceNotFound'):
+            raise
+        return
+    deadline = time.time() + wait_seconds
+    while time.time() < deadline:
+        try:
+            batch_client.job.get(job_id)
+            time.sleep(2)
+        except batchmodels.BatchErrorException as e:
+            code = getattr(getattr(e, 'error', None), 'code', None)
+            if code in ('JobNotFound', 'ResourceNotFound'):
+                return
+            raise
+    log.warning("Job '%s' deletion confirmation did not complete within %ds.", job_id, wait_seconds)
+
+
+def _delete_pool_if_exists(batch_client: BatchServiceClient, pool_id: str, wait_seconds: int = 120):
+    """Delete a pool if it exists and wait until it's gone (best-effort)."""
+    try:
+        log.info("Deleting existing pool '%s' if present...", pool_id)
+        batch_client.pool.delete(pool_id)
+    except batchmodels.BatchErrorException as e:
+        code = getattr(getattr(e, 'error', None), 'code', None)
+        if code not in ('PoolNotFound', 'ResourceNotFound'):
+            raise
+        return
+    deadline = time.time() + wait_seconds
+    while time.time() < deadline:
+        try:
+            batch_client.pool.get(pool_id)
+            time.sleep(3)
+        except batchmodels.BatchErrorException as e:
+            code = getattr(getattr(e, 'error', None), 'code', None)
+            if code in ('PoolNotFound', 'ResourceNotFound'):
+                return
+            raise
+    log.warning("Pool '%s' deletion confirmation did not complete within %ds.", pool_id, wait_seconds)
 
 
 if __name__ == '__main__':
 
     start_time = datetime.datetime.now().replace(microsecond=0)
-    print('Sample start: {}'.format(start_time))
-    print()
+    log.info('Start time: %s', start_time)
 
-    # Create the blob client, for use in obtaining references to
-    # blob storage containers and uploading files to containers.
-
-    blob_client = azureblob.BlockBlobService(
-        account_name=config._STORAGE_ACCOUNT_NAME,
-        account_key=config._STORAGE_ACCOUNT_KEY)
-
-    # Use the blob client to create the containers in Azure Storage if they
-    # don't yet exist.
+    # Storage (AAD, v12)
+    aad_cred = DefaultAzureCredential(exclude_interactive_browser_credential=False)
+    storage = StorageV12(config._STORAGE_ACCOUNT_NAME, aad_cred)
 
     input_container_name = 'input'
     output_container_name = 'output'
-    blob_client.create_container(input_container_name, fail_on_exist=False)
-    blob_client.create_container(output_container_name, fail_on_exist=False)
-    print('Container [{}] created.'.format(input_container_name))
-    print('Container [{}] created.'.format(output_container_name))
+    # Optional: clean storage at start
+    if getattr(config, '_CLEAN_STORAGE_AT_START', False):
+        storage.delete_container_if_exists(input_container_name)
+        storage.delete_container_if_exists(output_container_name)
+    storage.ensure_container(input_container_name)
+    storage.ensure_container(output_container_name)
 
     # Create a list of all MP4 files in the InputFiles directory.
     input_file_paths = []
@@ -326,27 +513,41 @@ if __name__ == '__main__':
 
     # Upload the input files. This is the collection of files that are to be processed by the tasks.
     input_files = [
-        upload_file_to_container(blob_client, input_container_name, file_path)
+        upload_file_to_container(storage, input_container_name, file_path)
         for file_path in input_file_paths]
+    log.info("Input file count: %d", len(input_file_paths))
 
     # Obtain a shared access signature URL that provides write access to the output
     # container to which the tasks will upload their output.
 
-    output_container_sas_url = get_container_sas_url(
-        blob_client,
+    output_container_sas_url = get_container_sas_url_for_write(
+        storage,
         output_container_name,
-        azureblob.BlobPermissions.WRITE)
+    )
 
-    # Create a Batch service client. We'll now be interacting with the Batch
-    # service in addition to Storage
-    credentials = batchauth.SharedKeyCredentials(config._BATCH_ACCOUNT_NAME,
-                                                 config._BATCH_ACCOUNT_KEY)
-
-    batch_client = batch.BatchServiceClient(
-        credentials,
-        batch_url=config._BATCH_ACCOUNT_URL)
+    # Create a Batch service client (AAD or SharedKey)
+    batch_url = _normalize_batch_url(getattr(config, '_BATCH_ACCOUNT_URL', ''))
+    auth_mode = getattr(config, '_AUTH_MODE', 'SharedKey').upper()
+    log.info("Batch URL: %s", batch_url)
+    log.info("Auth mode: %s", auth_mode)
+    if auth_mode == 'AAD':
+        # AAD 認証: 毎リクエスト前にトークンを更新する msrest 互換クレデンシャルを使用
+        token_creds = AADTokenCredentials(aad_cred, "https://batch.core.windows.net/.default")
+        batch_client = BatchServiceClient(token_creds, batch_url=batch_url)
+    else:
+        # SharedKey 認証
+        creds = batch_auth.SharedKeyCredentials(
+            config._BATCH_ACCOUNT_NAME,
+            config._BATCH_ACCOUNT_KEY
+        )
+        batch_client = BatchServiceClient(creds, batch_url=batch_url)
 
     try:
+        # Clean start: delete existing resources (pool deletion is optional)
+        _delete_job_if_exists(batch_client, config._JOB_ID)
+        if getattr(config, '_DELETE_EXISTING_POOL_AT_START', False):
+            _delete_pool_if_exists(batch_client, config._POOL_ID)
+
         # Create the pool that will contain the compute nodes that will execute the
         # tasks.
         create_pool(batch_client, config._POOL_ID)
@@ -364,30 +565,19 @@ if __name__ == '__main__':
                                    config._JOB_ID,
                                    datetime.timedelta(minutes=30))
 
-        print("  Success! All tasks reached the 'Completed' state within the "
-              "specified timeout period.")
+        log.info("Success: all tasks reached 'Completed' within the timeout.")
 
     except batchmodels.BatchErrorException as err:
-        print_batch_exception(err)
+        log_batch_exception(err)
         raise
 
     # Delete input container in storage
-    print('Deleting container [{}]...'.format(input_container_name))
-    blob_client.delete_container(input_container_name)
+    storage.delete_container_if_exists(input_container_name)
 
     # Print out some timing info
     end_time = datetime.datetime.now().replace(microsecond=0)
-    print()
-    print('Sample end: {}'.format(end_time))
-    print('Elapsed time: {}'.format(end_time - start_time))
-    print()
+    log.info('End time: %s', end_time)
+    log.info('Elapsed: %s', end_time - start_time)
 
-    # Clean up Batch resources (if the user so chooses).
-    if query_yes_no('Delete job?') == 'yes':
-        batch_client.job.delete(config._JOB_ID)
-
-    if query_yes_no('Delete pool?') == 'yes':
-        batch_client.pool.delete(config._POOL_ID)
-
-    print()
-    input('Press ENTER to exit...')
+    # リソースは残します（ジョブ/プールの削除確認は行いません）
+    # 終了プロンプトを廃止
