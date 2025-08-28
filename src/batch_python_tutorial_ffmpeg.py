@@ -217,7 +217,7 @@ def create_pool(batch_service_client, pool_id):
         name="AzureMonitorLinuxAgent",
         publisher="Microsoft.Azure.Monitor",
         type="AzureMonitorLinuxAgent",
-        type_handler_version="1.*",
+        type_handler_version="1.0",
         auto_upgrade_minor_version=True,
         settings={}  # 基本は空でOK、DCRに紐づければLAに飛ぶ
     )
